@@ -261,7 +261,7 @@ def main() -> None:
         split = "test" if args.run_mode == "test" else "valid"
         executor.test({split: datasets[split]})
     elif args.run_mode == 'infer':
-
+        print("it's being developed.")
 
     else:
         raise ValueError(f"Unknown mode: {args.run_mode}")
