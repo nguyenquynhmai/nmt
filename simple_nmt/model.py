@@ -1,183 +1,189 @@
-import random
-from typing import Tuple
-
 import torch.nn as nn
-import torch.optim as optim
+import torch
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
-from torch import Tensor
+
+class EncoderDecoder(nn.Module):
+    """
+    A standard Encoder-Decoder architecture. Base for this and many other models.
+    """
+
+    def __init__(self, encoder, decoder, src_embed, trg_embed, generator):
+        super(EncoderDecoder, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.src_embed = src_embed
+        self.trg_embed = trg_embed
+        self.generator = generator
+
+    def forward(self, src, trg, src_mask, trg_mask, src_lengths, trg_lengths):
+        """
+        Take in and process masked src and target sequences.
+        """
+        encoder_hidden, encoder_final = self.encode(src, src_mask, src_lengths)
+        return self.decode(encoder_hidden, encoder_final, src_mask, trg, trg_mask)
+
+    def encode(self, src, src_mask, src_lengths):
+        return self.encoder(self.src_embed(src), src_mask, src_lengths)
+
+    def decode(self, encoder_hidden, encoder_final, src_mask, trg, trg_mask, decoder_hidden=None):
+        return self.decoder(self.trg_embed(trg), encoder_hidden, encoder_final, src_mask, trg_mask, hidden=decoder_hidden)
+
+
+class Generator(nn.Module):
+    """Define standard linear + softmax generation step."""
+    def __init__(self, hidden_size, vocab_size):
+        super(Generator, self).__init__()
+        self.proj = nn.Linear(hidden_size, vocab_size, bias=False)
+    
+    def forward(self, x):
+        return F.log_softmax(self.proj(x), dim=-1)
 
 
 class Encoder(nn.Module):
-    def __init__(self,
-                 input_dim: int,
-                 emb_dim: int,
-                 enc_hid_dim: int,
-                 dec_hid_dim: int,
-                 dropout: float):
-        super().__init__()
-
-        self.input_dim = input_dim
-        self.emb_dim = emb_dim
-        self.enc_hid_dim = enc_hid_dim
-        self.dec_hid_dim = dec_hid_dim
-        self.dropout = dropout
-
-        self.embedding = nn.Embedding(input_dim, emb_dim)
-
-        self.rnn = nn.GRU(emb_dim, enc_hid_dim, bidirectional=True)
-
-        self.fc = nn.Linear(enc_hid_dim * 2, dec_hid_dim)
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self,
-                src: Tensor) -> Tuple[Tensor]:
-
-        embedded = self.dropout(self.embedding(src))
-
-        outputs, hidden = self.rnn(embedded)
-
-        hidden = torch.tanh(self.fc(torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim = 1)))
-
-        return outputs, hidden
+    def __init__(self, input_size, hidden_size, num_layers=1, dropout=0.):
+        super(Encoder, self).__init__()
+        self.num_layers = num_layers
+        self.rnn = nn.GRU(input_size, hidden_size, num_layers, batch_first=True, bidirectional=True, dropout=dropout)
 
 
-class Attention(nn.Module):
-    def __init__(self,
-                 enc_hid_dim: int,
-                 dec_hid_dim: int,
-                 attn_dim: int):
-        super().__init__()
+    def forward(self, x, mask, lengths):
+        """
+        Applies a bidirectional GRU to sequence of embeddings x.
+        The input mini-batch x needs to be stored by length.
+        x should have dimensions [batch, time, dim].
+        """
 
-        self.enc_hid_dim = enc_hid_dim
-        self.dec_hid_dim = dec_hid_dim
+        packed = pack_padded_sequence(x, lengths, batch_first=True)
+        output, final = self.rnn(packed)
+        output, _ = pad_packed_sequence(output, batch_first=True)
 
-        self.attn_in = (enc_hid_dim * 2) + dec_hid_dim
+        # we need to manually concatenate the final states for both directions
+        fwd_final = final[0:final.size(0): 2]
+        bwd_final = final[1:final.size(0): 2]
+        final = torch.cat([fwd_final, bwd_final], dim=2) # [number_layers, batch, 2*dim]
 
-        self.attn = nn.Linear(self.attn_in, attn_dim)
-
-    def forward(self,
-                decoder_hidden: Tensor,
-                encoder_outputs: Tensor) -> Tensor:
-
-        src_len = encoder_outputs.shape[0]
-
-        repeated_decoder_hidden = decoder_hidden.unsqueeze(1).repeat(1, src_len, 1)
-
-        encoder_outputs = encoder_outputs.permute(1, 0, 2)
-
-        energy = torch.tanh(self.attn(torch.cat((
-            repeated_decoder_hidden,
-            encoder_outputs),
-            dim = 2)))
-
-        attention = torch.sum(energy, dim=2)
-
-        return F.softmax(attention, dim=1)
+        return output, final
 
 
 class Decoder(nn.Module):
-    def __init__(self,
-                 output_dim: int,
-                 emb_dim: int,
-                 enc_hid_dim: int,
-                 dec_hid_dim: int,
-                 dropout: int,
-                 attention: nn.Module):
-        super().__init__()
+    """A conditional RNN decoder with attention."""
 
-        self.emb_dim = emb_dim
-        self.enc_hid_dim = enc_hid_dim
-        self.dec_hid_dim = dec_hid_dim
-        self.output_dim = output_dim
-        self.dropout = dropout
+    def __init__(self, emb_size, hidden_size, attention, num_layers=1, dropout=0.5, bridge=True):
+        super(Decoder, self).__init__()
+        
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
         self.attention = attention
+        self.dropout = dropout
 
-        self.embedding = nn.Embedding(output_dim, emb_dim)
+        self.rnn = nn.GRU(emb_size + 2*hidden_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
 
-        self.rnn = nn.GRU((enc_hid_dim * 2) + emb_dim, dec_hid_dim)
+        # to initialize from the final encoder state
+        self.bridge = nn.Linear(2*hidden_size, hidden_size, bias=True) if bridge else None
 
-        self.out = nn.Linear(self.attention.attn_in + emb_dim, output_dim)
+        self.dropout_layer = nn.Dropout(p=dropout)
+        self.pre_output_layer = nn.Linear(hidden_size + 2*hidden_size + emb_size, hidden_size, bias=False)
 
-        self.dropout = nn.Dropout(dropout)
+    def forward_step(self, prev_embed, encoder_hidden, src_mask, proj_key, hidden):
+        """Perform a single decoder step (1 word)"""
+
+        # compute context vector using attention mechanism
+        query = hidden[-1].unsqueeze(1)  # [#layers, B, D] -> [B, 1, D]
+        context, attn_probs = self.attention(query=query, proj_key=proj_key, value=encoder_hidden, mask=src_mask)
+
+        # update rnn hidden state
+        rnn_input = torch.cat([prev_embed, context], dim=2)
+        output, hidden = self.rnn(rnn_input, hidden)
+
+        pre_output = torch.cat([prev_embed, output, context], dim=2)
+        pre_output = self.dropout_layer(pre_output)
+        pre_output = self.pre_output_layer(pre_output)
+
+        return output, hidden, pre_output
+
+    def forward(self, trg_embed, encoder_hidden, encoder_final, src_mask, trg_mask, hidden=None, max_len=None):
+        """Unroll the decoder one step at a time"""
+
+        # the maximum number of steps to unroll the RNN
+        if max_len is None:
+            max_len = trg_mask.size(-1)
+        
+        # initialize decoder hidden state
+        if hidden is None:
+            hidden = self.init_hidden(encoder_final)
+        
+
+        # pre-compute projected encoder hidden states
+        # the keys for the attention mechanism
+        # this is only done for efficiency
+        proj_key = self.attention.key_layer(encoder_hidden)
+
+        # here we store all intermediate hidden states and pre-output vectors
+        decoder_states = []
+        pre_output_vectors = []
+
+        # unroll the decoder RNN for max_len steps
+        for i in range(max_len):
+            prev_embed = trg_embed[:, i].unsqueeze(1)
+            output, hidden, pre_output = self.forward_step(prev_embed, encoder_hidden, src_mask, proj_key, hidden)
+            decoder_states.append(output)
+            pre_output_vectors.append(pre_output)
+
+        decoder_states = torch.cat(decoder_states, dim=1)
+        pre_output_vectors = torch.cat(pre_output_vectors, dim=1)
+        return decoder_states, hidden, pre_output_vectors           # [B, N, D]
+
+    def init_hidden(self, encoder_final):
+        """Returns the initial decoder state, conditioned on the final encoder state."""
+
+        if encoder_final is None:
+            return None # start with zeros
+        
+        return torch.tanh(self.bridge(encoder_final))
 
 
-    def _weighted_encoder_rep(self,
-                              decoder_hidden: Tensor,
-                              encoder_outputs: Tensor) -> Tensor:
+class BahdanauAttention(nn.Module):
+    """Implement Bahdanau (MLP) attention"""
 
-        a = self.attention(decoder_hidden, encoder_outputs)
+    def __init__(self, hidden_size, key_size=None, query_size=None):
+        super(BahdanauAttention, self).__init__()
 
-        a = a.unsqueeze(1)
+        # we assume a bi-directional encoder so key_size is 2*hidden_size
+        key_size = 2 * hidden_size if key_size is None else key_size
+        query_size = hidden_size if query_size is None else query_size
 
-        encoder_outputs = encoder_outputs.permute(1, 0, 2)
+        self.key_layer = nn.Linear(key_size, hidden_size, bias=False)
+        self.query_layer = nn.Linear(query_size, hidden_size, bias=False)
+        self.energy_layer = nn.Linear(hidden_size, 1, bias=False)
 
-        weighted_encoder_rep = torch.bmm(a, encoder_outputs)
+        # to store attention scores
+        self.alphas = None
 
-        weighted_encoder_rep = weighted_encoder_rep.permute(1, 0, 2)
+    def forward(self, query=None, proj_key=None, value=None, mask=None):
+        assert mask is not None, "mask is required"
 
-        return weighted_encoder_rep
-
-
-    def forward(self,
-                input: Tensor,
-                decoder_hidden: Tensor,
-                encoder_outputs: Tensor) -> Tuple[Tensor]:
-
-        input = input.unsqueeze(0)
-
-        embedded = self.dropout(self.embedding(input))
-
-        weighted_encoder_rep = self._weighted_encoder_rep(decoder_hidden,
-                                                          encoder_outputs)
-
-        rnn_input = torch.cat((embedded, weighted_encoder_rep), dim = 2)
-
-        output, decoder_hidden = self.rnn(rnn_input, decoder_hidden.unsqueeze(0))
-
-        embedded = embedded.squeeze(0)
-        output = output.squeeze(0)
-        weighted_encoder_rep = weighted_encoder_rep.squeeze(0)
-
-        output = self.out(torch.cat((output,
-                                     weighted_encoder_rep,
-                                     embedded), dim = 1))
-
-        return output, decoder_hidden.squeeze(0)
+        # We first project the query (the decoder state).
+        # The projected keys (the encoder states) were already pre-computed
+        query = self.query_layer(query)
 
 
-class Seq2Seq(nn.Module):
-    def __init__(self,
-                 encoder: nn.Module,
-                 decoder: nn.Module,
-                 device: torch.device):
-        super().__init__()
+        # Calculate scores.
+        scores = self.energy_layer(torch.tanh(query+proj_key))
+        scores = scores.squeeze(2).unsqueeze(1)
 
-        self.encoder = encoder
-        self.decoder = decoder
-        self.device = device
+        # Mask out invalid positions.
+        # The mask marks valid positions so we invert it using `mask & 0`
+        scores.data.masked_fill_(mask== 0, -float('inf'))
 
-    def forward(self,
-                src: Tensor,
-                trg: Tensor,
-                teacher_forcing_ratio: float = 0.5) -> Tensor:
+        # Turn scores to probabilities
+        alphas = F.softmax(scores, dim=-1)
+        self.alphas = alphas
 
-        batch_size = src.shape[1]
-        max_len = trg.shape[0]
-        trg_vocab_size = self.decoder.output_dim
+        # The context vector is the weight sum of the values
+        context = torch.bmm(alphas, value)
 
-        outputs = torch.zeros(max_len, batch_size, trg_vocab_size).to(self.device)
+        # context shape [B, 1, 2D], alphas shape: [B, 1 , N]
+        return context, alphas
 
-        encoder_outputs, hidden = self.encoder(src)
-
-        # first input to the decoder is the <sos> token
-        output = trg[0,:]
-
-        for t in range(1, max_len):
-            output, hidden = self.decoder(output, hidden, encoder_outputs)
-            outputs[t] = output
-            teacher_force = random.random() < teacher_forcing_ratio
-            top1 = output.max(1)[1]
-            output = (trg[t] if teacher_force else top1)
-
-        return outputs
+            
